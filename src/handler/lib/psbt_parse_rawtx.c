@@ -403,6 +403,8 @@ static int parse_rawtx_outputs(parse_rawtx_state_t *state, buffer_t *buffers[2])
 }
 
 static int parse_rawtx_witnesses_init(parse_rawtx_state_t *state, buffer_t *buffers[2]) {
+    (void) buffers;
+
     // only relevant for segwit txs
     state->wit_counter = 0;
     state->is_cur_wit_stack_elements_read = false;

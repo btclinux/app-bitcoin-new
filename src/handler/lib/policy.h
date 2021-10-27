@@ -19,8 +19,7 @@ int call_get_wallet_script(dispatcher_context_t *dispatcher_context,
                            uint32_t n_keys,
                            bool change,
                            size_t address_index,
-                           buffer_t *out_buf,
-                           cx_hash_t *hash_context);
+                           buffer_t *out_buf);
 
 /**
  * TODO
