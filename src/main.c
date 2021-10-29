@@ -40,6 +40,8 @@
 
 #include "main.h"
 
+// #include "stash.h"
+
 #ifdef HAVE_BOLOS_APP_STACK_CANARY
 extern unsigned int app_stack_canary;
 #endif
@@ -145,6 +147,8 @@ void init_coin_config(btchip_altcoin_config_t *coin_config) {
 }
 
 void app_main() {
+    // stash_init();
+
     for (;;) {
         // Length of APDU command received in G_io_apdu_buffer
         int input_len = 0;

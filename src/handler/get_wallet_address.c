@@ -232,13 +232,20 @@ static void compute_address(dispatcher_context_t *dc) {
 
     buffer_t script_buf = buffer_create(state->script, sizeof(state->script));
 
-    int script_len = call_get_wallet_script(dc,
-                                            &state->wallet_policy_map,
-                                            state->wallet_header_keys_info_merkle_root,
-                                            state->wallet_header_n_keys,
-                                            state->is_change,
-                                            state->address_index,
-                                            &script_buf);
+    uint8_t derived_pubkeys[MAX_POLICY_MAP_KEYS][33];
+
+    if (compute_policy_pubkeys(dc,
+                               state->wallet_header_keys_info_merkle_root,
+                               state->wallet_header_n_keys,
+                               state->is_change,
+                               state->address_index,
+                               &derived_pubkeys) < 0) {
+        SEND_SW(dc, SW_BAD_STATE);  // unexpected
+        return;
+    }
+
+    int script_len =
+        call_get_wallet_script(&state->wallet_policy_map, &derived_pubkeys, &script_buf);
     if (script_len < 0) {
         SEND_SW(dc, SW_BAD_STATE);  // unexpected
         return;

@@ -15,20 +15,29 @@ int compare_wallet_script_at_path(dispatcher_context_t *dispatcher_context,
                                   const uint8_t keys_merkle_root[static 32],
                                   uint32_t n_keys,
                                   uint8_t expected_script[],
-                                  size_t expected_script_len) {
+                                  size_t expected_script_len,
+                                  uint8_t aux_mem[static MAX_POLICY_MAP_KEYS * 33]) {
     LOG_PROCESSOR(dispatcher_context, __FILE__, __LINE__, __func__);
+
+    if (change != 0 && change != 1) {
+        return -1;
+    }
 
     // derive wallet's scriptPubKey, check if it matches the expected one
     uint8_t wallet_script[MAX_PREVOUT_SCRIPTPUBKEY_LEN];
     buffer_t wallet_script_buf = buffer_create(wallet_script, sizeof(wallet_script));
 
-    int wallet_script_len = call_get_wallet_script(dispatcher_context,
-                                                   policy,
-                                                   keys_merkle_root,
-                                                   n_keys,
-                                                   change,
-                                                   address_index,
-                                                   &wallet_script_buf);
+    if (compute_policy_pubkeys(dispatcher_context,
+                               keys_merkle_root,
+                               n_keys,
+                               change,
+                               address_index,
+                               aux_mem) < 0) {
+        return -1;
+    }
+
+    int wallet_script_len = call_get_wallet_script(policy, aux_mem, &wallet_script_buf);
+
     if (wallet_script_len < 0) {
         PRINTF("Failed to get wallet script\n");
         return -1;  // shouldn't happen

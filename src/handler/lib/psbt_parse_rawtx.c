@@ -476,7 +476,6 @@ static int parse_rawtx_locktime(parse_rawtx_state_t *state, buffer_t *buffers[2]
     uint8_t locktime_bytes[4];
     bool result = dbuffer_read_bytes(buffers, locktime_bytes, 4);
     if (result) {
-        PRINTF("LOCKTIME: %08X\n", *((uint32_t *) locktime_bytes));
         crypto_hash_update(&state->hash_context->header, locktime_bytes, 4);
     }
     return result;

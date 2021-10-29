@@ -34,9 +34,10 @@ typedef struct {
     int script_len;
 
     uint32_t sighash_type;
+    uint8_t segwit_version;
 
-    int change;
-    int address_index;
+    uint32_t change;
+    uint32_t address_index;
 } cur_input_info_t;
 
 typedef struct {
@@ -56,6 +57,8 @@ typedef struct {
     uint8_t scriptpubkey[MAX_PREVOUT_SCRIPTPUBKEY_LEN];
     int scriptpubkey_len;
 
+    uint32_t change;
+    uint32_t address_index;
 } cur_output_info_t;
 
 typedef struct {
@@ -119,6 +122,15 @@ typedef struct {
 
     int our_key_derivation_length;
     uint32_t our_key_derivation[MAX_BIP32_PATH_STEPS];
+
+    // the following variables could be on the stack, but are put in the global space in order
+    // to cope with the 1500 bytes stack limit on Nano S.
+    // TODO: refactor once the limit is removed
+    uint8_t aux_mem[MAX_POLICY_MAP_KEYS * 33];  // general purpose auxiliary memory;
+                                                // hack to reduce stack consumption
+
+    cx_sha256_t sighash_context;
+    cx_sha256_t sighash_context2;
 } sign_psbt_state_t;
 
 void handler_sign_psbt(dispatcher_context_t *dispatcher_context);

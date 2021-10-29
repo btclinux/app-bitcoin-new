@@ -25,21 +25,23 @@ typedef struct {
 } policy_parser_node_state_t;
 
 typedef struct {
-    dispatcher_context_t *dispatcher_context;
-    const uint8_t *keys_merkle_root;
-    uint32_t n_keys;
-    bool change;
-    size_t address_index;
-
     policy_parser_node_state_t nodes[MAX_POLICY_DEPTH];
     int node_stack_eos;
 
-    uint8_t derived_pubkeys[MAX_POLICY_MAP_KEYS][33];  // buffer to precompute derived keys
+    uint8_t (*derived_pubkeys)[MAX_POLICY_MAP_KEYS][33];  // buffer to precompute derived keys
 
     cx_sha256_t hash_context;  // shared among all the nodes; there are never two concurrent
                                // hash computations in process.
     uint8_t hash[32];  // when a node processed in hash mode is popped, the hash is computed here
 } policy_parser_state_t;
+
+typedef struct {
+    dispatcher_context_t *dispatcher_context;
+    const uint8_t *keys_merkle_root;
+    uint32_t n_keys;
+    bool change;
+    size_t address_index;
+} keys_context_t;
 
 // comparator for pointers to compressed pubkeys
 static int cmp_compressed_pubkeys(const void *a, const void *b) {
@@ -58,14 +60,13 @@ static int cmp_compressed_pubkeys(const void *a, const void *b) {
 // p2sh (also nested segwit) ==> legacy script  (start with 3 on mainnet, 2 on testnet)
 // p2wpkh or p2wsh           ==> bech32         (sart with bc1 on mainnet, tb1 on testnet)
 
-static int __attribute__((noinline)) get_and_parse_key_info(policy_parser_state_t *state,
-                                                            size_t key_index,
-                                                            policy_map_key_info_t *key_info) {
+static int __attribute__((noinline))
+get_and_parse_key_info(keys_context_t *context, size_t key_index, policy_map_key_info_t *key_info) {
     char key_info_str[MAX_POLICY_KEY_INFO_LEN];
 
-    int key_info_len = call_get_merkle_leaf_element(state->dispatcher_context,
-                                                    state->keys_merkle_root,
-                                                    state->n_keys,
+    int key_info_len = call_get_merkle_leaf_element(context->dispatcher_context,
+                                                    context->keys_merkle_root,
+                                                    context->n_keys,
                                                     key_index,
                                                     (uint8_t *) key_info_str,
                                                     sizeof(key_info_str));
@@ -85,14 +86,13 @@ static int __attribute__((noinline)) get_and_parse_key_info(policy_parser_state_
 
 // convenience function, split from get_derived_pubkey only to improve stack usage
 // returns -1 on error, 0 if the returned key info has no wildcard (**), 1 if it has the wildcard
-static int __attribute__((noinline)) get_extended_pubkey(policy_parser_state_t *state,
-                                                         int key_index,
-                                                         serialized_extended_pubkey_t *out) {
+static int __attribute__((noinline))
+get_extended_pubkey(keys_context_t *context, int key_index, serialized_extended_pubkey_t *out) {
     PRINT_STACK_POINTER();
 
     policy_map_key_info_t key_info;
 
-    if (get_and_parse_key_info(state, key_index, &key_info) < 0) {
+    if (get_and_parse_key_info(context, key_index, &key_info) < 0) {
         return -1;
     }
 
@@ -113,12 +113,12 @@ static int __attribute__((noinline)) get_extended_pubkey(policy_parser_state_t *
     return key_info.has_wildcard ? 1 : 0;
 }
 
-static int get_derived_pubkey(policy_parser_state_t *state, int key_index, uint8_t out[static 33]) {
+static int get_derived_pubkey(keys_context_t *context, int key_index, uint8_t out[static 33]) {
     PRINT_STACK_POINTER();
 
     serialized_extended_pubkey_t ext_pubkey;
 
-    int ret = get_extended_pubkey(state, key_index, &ext_pubkey);
+    int ret = get_extended_pubkey(context, key_index, &ext_pubkey);
     if (ret < 0) {
         return -1;
     }
@@ -126,8 +126,8 @@ static int get_derived_pubkey(policy_parser_state_t *state, int key_index, uint8
     if (ret == 1) {
         // we derive the /change/address_index child of this pubkey
         // we reuse the same memory of ext_pubkey
-        bip32_CKDpub(&ext_pubkey, state->change, &ext_pubkey);
-        bip32_CKDpub(&ext_pubkey, state->address_index, &ext_pubkey);
+        bip32_CKDpub(&ext_pubkey, context->change, &ext_pubkey);
+        bip32_CKDpub(&ext_pubkey, context->address_index, &ext_pubkey);
     }
 
     memcpy(out, ext_pubkey.compressed_pubkey, 33);
@@ -303,17 +303,17 @@ static int process_multi_sortedmulti_node(policy_parser_state_t *state) {
 
         // bubble sort
         bool swapped;
+        uint8_t(*derived_pubkeys)[MAX_POLICY_MAP_KEYS][33] = state->derived_pubkeys;
         do {
             swapped = false;
             for (unsigned int i = 1; i < policy->n; i++) {
-                if (cmp_compressed_pubkeys(state->derived_pubkeys[i - 1],
-                                           state->derived_pubkeys[i]) > 0) {
+                if (cmp_compressed_pubkeys((*derived_pubkeys)[i - 1], (*derived_pubkeys)[i]) > 0) {
                     swapped = true;
 
                     for (int j = 0; j < 33; j++) {
-                        uint8_t t = state->derived_pubkeys[i - 1][j];
-                        state->derived_pubkeys[i - 1][j] = state->derived_pubkeys[i][j];
-                        state->derived_pubkeys[i][j] = t;
+                        uint8_t t = (*derived_pubkeys)[i - 1][j];
+                        (*derived_pubkeys)[i - 1][j] = (*derived_pubkeys)[i][j];
+                        (*derived_pubkeys)[i][j] = t;
                     }
                 }
             }
@@ -323,7 +323,7 @@ static int process_multi_sortedmulti_node(policy_parser_state_t *state) {
     for (unsigned int i = 0; i < policy->n; i++) {
         // push <i-th pubkey> (33 = 0x21 bytes)
         update_output_u8(state, 0x21);
-        update_output(state, state->derived_pubkeys[i], 33);
+        update_output(state, (*state->derived_pubkeys)[i], 33);
     }
 
     update_output_u8(state, 0x50 + policy->n);  // OP_n
@@ -334,6 +334,8 @@ static int process_multi_sortedmulti_node(policy_parser_state_t *state) {
 }
 
 static int process_tr_node(policy_parser_state_t *state) {
+    PRINT_STACK_POINTER();
+
     policy_parser_node_state_t *node = &state->nodes[state->node_stack_eos];
 
     if (node->step != 0) {
@@ -369,32 +371,39 @@ static int process_tr_node(policy_parser_state_t *state) {
     return result;
 }
 
-int call_get_wallet_script(dispatcher_context_t *dispatcher_context,
-                           policy_node_t *policy,
+int compute_policy_pubkeys(dispatcher_context_t *dispatcher_context,
                            const uint8_t keys_merkle_root[static 32],
                            uint32_t n_keys,
                            bool change,
                            size_t address_index,
+                           uint8_t (*out_pubkeys)[MAX_POLICY_MAP_KEYS][33]) {
+    keys_context_t context = {.dispatcher_context = dispatcher_context,
+                              .keys_merkle_root = keys_merkle_root,
+                              .n_keys = n_keys,
+                              .change = change,
+                              .address_index = address_index};
+
+    // precompute all the derived pubkeys
+    for (unsigned int i = 0; i < n_keys; i++) {
+        if (get_derived_pubkey(&context, i, (*out_pubkeys)[i]) == -1) {
+            PRINTF("Failed to derive key #%d\n", i);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int call_get_wallet_script(policy_node_t *policy,
+                           uint8_t (*derived_pubkeys)[MAX_POLICY_MAP_KEYS][33],
                            buffer_t *out_buf) {
-    policy_parser_state_t state = {.dispatcher_context = dispatcher_context,
-                                   .keys_merkle_root = keys_merkle_root,
-                                   .n_keys = n_keys,
-                                   .change = change,
-                                   .address_index = address_index,
-                                   .node_stack_eos = 0};
+    PRINT_STACK_POINTER();
+
+    policy_parser_state_t state = {.node_stack_eos = 0, .derived_pubkeys = derived_pubkeys};
 
     state.nodes[0] = (policy_parser_node_state_t){.mode = MODE_OUT_BYTES,
                                                   .step = 0,
                                                   .policy_node = policy,
                                                   .out_buf = out_buf};
-
-    // precompute all the derived pubkeys
-    for (unsigned int i = 0; i < n_keys; i++) {
-        if (get_derived_pubkey(&state, i, state.derived_pubkeys[i]) == -1) {
-            PRINTF("Failed to derive key #%d\n", i);
-            return -1;
-        }
-    }
 
     int ret;
     do {

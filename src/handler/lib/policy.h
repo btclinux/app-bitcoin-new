@@ -13,12 +13,18 @@
 /**
  * TODO
  */
-int call_get_wallet_script(dispatcher_context_t *dispatcher_context,
-                           policy_node_t *policy,
+int compute_policy_pubkeys(dispatcher_context_t *dispatcher_context,
                            const uint8_t keys_merkle_root[static 32],
                            uint32_t n_keys,
                            bool change,
                            size_t address_index,
+                           uint8_t (*out_pubkeys)[MAX_POLICY_MAP_KEYS][33]);
+
+/**
+ * TODO
+ */
+int call_get_wallet_script(policy_node_t *policy,
+                           uint8_t (*derived_pubkeys)[MAX_POLICY_MAP_KEYS][33],
                            buffer_t *out_buf);
 
 /**

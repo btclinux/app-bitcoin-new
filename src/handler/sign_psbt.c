@@ -16,6 +16,7 @@
  *****************************************************************************/
 
 #include <stdint.h>
+#include <assert.h>
 
 #include "../boilerplate/dispatcher.h"
 #include "../boilerplate/sw.h"
@@ -61,13 +62,17 @@ static void process_global_map(dispatcher_context_t *dc);
 // Input validation
 static void process_input_map(dispatcher_context_t *dc);
 static void check_input_owned(dispatcher_context_t *dc);
+static void check_input_owned_compare_script(dispatcher_context_t *dc);
 
 static void alert_external_inputs(dispatcher_context_t *dc);
+
+static void input_next(dispatcher_context_t *dc);
 
 // Output validation
 static void verify_outputs_init(dispatcher_context_t *dc);
 static void process_output_map(dispatcher_context_t *dc);
 static void check_output_owned(dispatcher_context_t *dc);
+static void check_output_owned_compare_script(dispatcher_context_t *dc);
 static void output_validate_external(dispatcher_context_t *dc);
 static void output_next(dispatcher_context_t *dc);
 
@@ -84,6 +89,9 @@ static void sign_legacy_compute_sighash(dispatcher_context_t *dc);
 
 // Segwit sighash computation (P2WPKH, P2WSH and P2TR)
 static void sign_segwit(dispatcher_context_t *dc);
+static void sign_segwit2(dispatcher_context_t *dc);
+static void sign_segwit3(dispatcher_context_t *dc);
+static void sign_segwit4(dispatcher_context_t *dc);
 static void sign_segwit_v0(dispatcher_context_t *dc);
 static void sign_segwit_v1(dispatcher_context_t *dc);
 
@@ -115,14 +123,26 @@ the right paths to identify internal inputs/outputs.
 // Updates the hash_context with the network serialization of all the outputs
 // returns -1 on error (in that case, a response is already set). 0 on success.
 static int hash_outputs(dispatcher_context_t *dc, cx_hash_t *hash_context) {
+    PRINT_STACK_POINTER();
+
+    LOG_PROCESSOR(dc, __FILE__, __LINE__, __func__);
+
     sign_psbt_state_t *state = (sign_psbt_state_t *) &G_command_state;
 
     // TODO: support other SIGHASH FLAGS
     for (unsigned int i = 0; i < state->n_outputs; i++) {
         // get this output's map
-        merkleized_map_commitment_t ith_map;
 
-        int res = call_get_merkleized_map(dc, state->outputs_root, state->n_outputs, i, &ith_map);
+        // merkleized_map_commitment_t ith_map;
+        // hack to save stack: store the map_commitment in aux_mem, which is currently unused.
+        // TODO: remove once the stack limits are lifted
+
+        _Static_assert(sizeof(merkleized_map_commitment_t) < sizeof(state->aux_mem),
+                       "merkleized_map_commitment_t does't fit in aux_mem");
+
+        merkleized_map_commitment_t *ith_map = (merkleized_map_commitment_t *) state->aux_mem;
+
+        int res = call_get_merkleized_map(dc, state->outputs_root, state->n_outputs, i, ith_map);
         if (res < 0) {
             SEND_SW(dc, SW_INCORRECT_DATA);
             return -1;
@@ -131,7 +151,7 @@ static int hash_outputs(dispatcher_context_t *dc, cx_hash_t *hash_context) {
         // get output's amount
         uint8_t amount_raw[8];
         if (8 != call_get_merkleized_map_value(dc,
-                                               &ith_map,
+                                               ith_map,
                                                (uint8_t[]){PSBT_OUT_AMOUNT},
                                                1,
                                                amount_raw,
@@ -146,7 +166,7 @@ static int hash_outputs(dispatcher_context_t *dc, cx_hash_t *hash_context) {
 
         uint8_t out_script[MAX_PREVOUT_SCRIPTPUBKEY_LEN];
         int out_script_len = call_get_merkleized_map_value(dc,
-                                                           &ith_map,
+                                                           ith_map,
                                                            (uint8_t[]){PSBT_OUT_SCRIPT},
                                                            1,
                                                            out_script,
@@ -687,34 +707,42 @@ static void check_input_owned(dispatcher_context_t *dc) {
             }
         }
 
-        uint32_t change = bip32_path[bip32_path_len - 2];
-        uint32_t address_index = bip32_path[bip32_path_len - 1];
-
-        int res = compare_wallet_script_at_path(dc,
-                                                change,
-                                                address_index,
-                                                &state->wallet_policy_map,
-                                                state->wallet_header_keys_info_merkle_root,
-                                                state->wallet_header_n_keys,
-                                                state->cur_input.prevout_scriptpubkey,
-                                                state->cur_input.prevout_scriptpubkey_len);
-        if (res < 0) {
-            SEND_SW(dc, SW_INCORRECT_DATA);
-            return;
-        } else if (res == 0) {
-            external = true;
-            break;
-        } else if (res == 1) {
-            // input is internal, nothing to do
-        } else {
-            SEND_SW(dc, SW_BAD_STATE);  // should never happen
-            return;
-        }
+        state->cur_input.change = bip32_path[bip32_path_len - 2];
+        state->cur_input.address_index = bip32_path[bip32_path_len - 1];
     } while (false);  // executed only once; in a block only to be able to break out of it
 
     if (external) {
         PRINTF("INPUT %d is external\n", state->cur_input_index);
+        dc->next(input_next);
     } else {
+        dc->next(check_input_owned_compare_script);
+    }
+}
+
+// split to reduce stack usage
+static void check_input_owned_compare_script(dispatcher_context_t *dc) {
+    sign_psbt_state_t *state = (sign_psbt_state_t *) &G_command_state;
+
+    LOG_PROCESSOR(dc, __FILE__, __LINE__, __func__);
+
+    int res = compare_wallet_script_at_path(dc,
+                                            state->cur_input.change,
+                                            state->cur_input.address_index,
+                                            &state->wallet_policy_map,
+                                            state->wallet_header_keys_info_merkle_root,
+                                            state->wallet_header_n_keys,
+                                            state->cur_input.prevout_scriptpubkey,
+                                            state->cur_input.prevout_scriptpubkey_len,
+                                            state->aux_mem);
+    if (res < 0) {
+        SEND_SW(dc, SW_INCORRECT_DATA);
+        return;
+    } else if (res == 0) {
+        PRINTF("INPUT %d is external\n", state->cur_input_index);
+        // external input, nothing else to do
+    } else if (res == 1) {
+        // input is internal; record it and do some final sanity checks
+
         state->internal_inputs[state->cur_input_index] = 1;
         state->internal_inputs_total_value += state->cur_input.prevout_amount;
 
@@ -734,10 +762,12 @@ static void check_input_owned(dispatcher_context_t *dc) {
             SEND_SW(dc, SW_INCORRECT_DATA);
             return;
         }
+    } else {
+        SEND_SW(dc, SW_BAD_STATE);  // should never happen
+        return;
     }
 
-    ++state->cur_input_index;
-    dc->next(process_input_map);
+    dc->next(input_next);
 }
 
 // If there are external inputs, it is unsafe to sign, therefore we warn the user
@@ -778,6 +808,15 @@ static void ui_alert_external_inputs_result(dispatcher_context_t *dc, bool accep
     }
 
     dc->run();
+}
+
+static void input_next(dispatcher_context_t *dc) {
+    sign_psbt_state_t *state = (sign_psbt_state_t *) &G_command_state;
+
+    LOG_PROCESSOR(dc, __FILE__, __LINE__, __func__);
+
+    ++state->cur_input_index;
+    dc->next(process_input_map);
 }
 
 /** OUTPUTS VERIFICATION FLOW
@@ -976,10 +1015,10 @@ static void check_output_owned(dispatcher_context_t *dc) {
             external = true;
             break;
         }
-        uint32_t change = bip32_path[bip32_path_len - 2];
-        uint32_t address_index = bip32_path[bip32_path_len - 1];
+        state->cur_output.change = bip32_path[bip32_path_len - 2];
+        state->cur_output.address_index = bip32_path[bip32_path_len - 1];
 
-        if (change != 1) {
+        if (state->cur_output.change != 1) {
             // unlike for inputs, change must be 1 for this output to be considered internal
             external = true;
             break;
@@ -1000,25 +1039,6 @@ static void check_output_owned(dispatcher_context_t *dc) {
             }
         }
 
-        int res = compare_wallet_script_at_path(dc,
-                                                change,
-                                                address_index,
-                                                &state->wallet_policy_map,
-                                                state->wallet_header_keys_info_merkle_root,
-                                                state->wallet_header_n_keys,
-                                                state->cur_output.scriptpubkey,
-                                                state->cur_output.scriptpubkey_len);
-        if (res < 0) {
-            SEND_SW(dc, SW_INCORRECT_DATA);
-            return;
-        } else if (res == 0) {
-            external = true;
-        } else if (res == 1) {
-            // output is internal, nothing to do
-        } else {
-            SEND_SW(dc, SW_BAD_STATE);  // should never happen
-            return;
-        }
     } while (false);  // execute only once; just to be able to break out
 
     if (external) {
@@ -1028,12 +1048,43 @@ static void check_output_owned(dispatcher_context_t *dc) {
         dc->next(output_validate_external);
         return;
     } else {
+        dc->next(check_output_owned_compare_script);
+        return;
+    }
+}
+
+static void check_output_owned_compare_script(dispatcher_context_t *dc) {
+    sign_psbt_state_t *state = (sign_psbt_state_t *) &G_command_state;
+
+    LOG_PROCESSOR(dc, __FILE__, __LINE__, __func__);
+
+    int res = compare_wallet_script_at_path(dc,
+                                            state->cur_output.change,
+                                            state->cur_output.address_index,
+                                            &state->wallet_policy_map,
+                                            state->wallet_header_keys_info_merkle_root,
+                                            state->wallet_header_n_keys,
+                                            state->cur_output.scriptpubkey,
+                                            state->cur_output.scriptpubkey_len,
+                                            state->aux_mem);
+    if (res < 0) {
+        SEND_SW(dc, SW_INCORRECT_DATA);
+        return;
+    } else if (res == 0) {
+        // external output, user needs to validate
+
+        dc->next(output_validate_external);
+        return;
+    } else if (res == 1) {
         // valid change address, nothing to show to the user
 
         state->change_outputs_total_value += state->cur_output.value;
         ++state->change_count;
 
         dc->next(output_next);
+        return;
+    } else {
+        SEND_SW(dc, SW_BAD_STATE);  // should never happen
         return;
     }
 }
@@ -1354,14 +1405,16 @@ static void sign_legacy_compute_sighash(dispatcher_context_t *dc) {
 
     LOG_PROCESSOR(dc, __FILE__, __LINE__, __func__);
 
-    cx_sha256_t sighash_context;
-    cx_sha256_init(&sighash_context);
+    // hack to save stack: we use a sighash_context in the global space
+    cx_sha256_t *sighash_context = &state->sighash_context;
+
+    cx_sha256_init(sighash_context);
 
     uint8_t tmp[4];
     write_u32_le(tmp, 0, state->tx_version);
-    crypto_hash_update(&sighash_context.header, tmp, 4);
+    crypto_hash_update(&sighash_context->header, tmp, 4);
 
-    crypto_hash_update_varint(&sighash_context.header, state->n_inputs);
+    crypto_hash_update_varint(&sighash_context->header, state->n_inputs);
 
     for (unsigned int i = 0; i < state->n_inputs; i++) {
         // get this input's map
@@ -1391,7 +1444,7 @@ static void sign_legacy_compute_sighash(dispatcher_context_t *dc) {
             return;
         }
 
-        crypto_hash_update(&sighash_context.header, ith_prevout_hash, 32);
+        crypto_hash_update(&sighash_context->header, ith_prevout_hash, 32);
 
         uint8_t ith_prevout_n_raw[4];
         if (4 != call_get_merkleized_map_value(dc,
@@ -1404,17 +1457,17 @@ static void sign_legacy_compute_sighash(dispatcher_context_t *dc) {
             return;
         }
 
-        crypto_hash_update(&sighash_context.header, ith_prevout_n_raw, 4);
+        crypto_hash_update(&sighash_context->header, ith_prevout_n_raw, 4);
 
         if (i != state->cur_input_index) {
             // empty scriptcode
-            crypto_hash_update_u8(&sighash_context.header, 0x00);
+            crypto_hash_update_u8(&sighash_context->header, 0x00);
         } else {
             if (!state->cur_input.has_redeemScript) {
                 // P2PKH, the script_code is the prevout's scriptPubKey
-                crypto_hash_update_varint(&sighash_context.header,
+                crypto_hash_update_varint(&sighash_context->header,
                                           state->cur_input.prevout_scriptpubkey_len);
-                crypto_hash_update(&sighash_context.header,
+                crypto_hash_update(&sighash_context->header,
                                    state->cur_input.prevout_scriptpubkey,
                                    state->cur_input.prevout_scriptpubkey_len);
             } else {
@@ -1427,7 +1480,7 @@ static void sign_legacy_compute_sighash(dispatcher_context_t *dc) {
                                                  (uint8_t[]){PSBT_IN_REDEEM_SCRIPT},
                                                  1,
                                                  NULL,
-                                                 &sighash_context.header);
+                                                 &sighash_context->header);
 
                 if (redeemScript_len < 0) {
                     PRINTF("Error fetching redeemScript\n");
@@ -1448,25 +1501,25 @@ static void sign_legacy_compute_sighash(dispatcher_context_t *dc) {
             memset(ith_nSequence_raw, 0xFF, 4);
         }
 
-        crypto_hash_update(&sighash_context.header, ith_nSequence_raw, 4);
+        crypto_hash_update(&sighash_context->header, ith_nSequence_raw, 4);
     }
 
     // outputs
-    crypto_hash_update_varint(&sighash_context.header, state->n_outputs);
-    if (hash_outputs(dc, &sighash_context.header) == -1) {
+    crypto_hash_update_varint(&sighash_context->header, state->n_outputs);
+    if (hash_outputs(dc, &sighash_context->header) == -1) {
         return;  // response alredy set
     }
 
     // nLocktime
     write_u32_le(tmp, 0, state->locktime);
-    crypto_hash_update(&sighash_context.header, tmp, 4);
+    crypto_hash_update(&sighash_context->header, tmp, 4);
 
     // hash type
     write_u32_le(tmp, 0, state->cur_input.sighash_type);
-    crypto_hash_update(&sighash_context.header, tmp, 4);
+    crypto_hash_update(&sighash_context->header, tmp, 4);
 
     // compute sighash
-    crypto_hash_digest(&sighash_context.header, state->sighash, 32);
+    crypto_hash_digest(&sighash_context->header, state->sighash, 32);
     cx_hash_sha256(state->sighash, 32, state->sighash, 32);
 
     dc->next(sign_sighash_ecdsa);
@@ -1476,8 +1529,6 @@ static void sign_segwit(dispatcher_context_t *dc) {
     sign_psbt_state_t *state = (sign_psbt_state_t *) &G_command_state;
 
     LOG_PROCESSOR(dc, __FILE__, __LINE__, __func__);
-
-    uint8_t segwit_version;
 
     {
         uint8_t raw_witnessUtxo[8 + 1 + MAX_PREVOUT_SCRIPTPUBKEY_LEN];
@@ -1544,30 +1595,41 @@ static void sign_segwit(dispatcher_context_t *dc) {
 
             state->cur_input.script_len = redeemScript_length;
             memcpy(state->cur_input.script, redeemScript, redeemScript_length);
-            segwit_version = get_segwit_version(redeemScript, redeemScript_length);
+            state->cur_input.segwit_version = get_segwit_version(redeemScript, redeemScript_length);
         } else {
             state->cur_input.script_len = wit_utxo_scriptPubkey_len;
             memcpy(state->cur_input.script, wit_utxo_scriptPubkey, wit_utxo_scriptPubkey_len);
 
-            segwit_version = get_segwit_version(wit_utxo_scriptPubkey, wit_utxo_scriptPubkey_len);
+            state->cur_input.segwit_version =
+                get_segwit_version(wit_utxo_scriptPubkey, wit_utxo_scriptPubkey_len);
         }
     }
 
-    if (segwit_version > 1) {
-        PRINTF("Segwit version not supported: %d\n", segwit_version);
+    LOG_PROCESSOR(dc, __FILE__, __LINE__, __func__);
+
+    if (state->cur_input.segwit_version > 1) {
+        PRINTF("Segwit version not supported: %d\n", state->cur_input.segwit_version);
         SEND_SW(dc, SW_NOT_SUPPORTED);
         return;
     }
 
-    // compute all the tx-wide hashes
+    dc->next(sign_segwit2);
+}
 
+static void sign_segwit2(dispatcher_context_t *dc) {
+    sign_psbt_state_t *state = (sign_psbt_state_t *) &G_command_state;
+
+    LOG_PROCESSOR(dc, __FILE__, __LINE__, __func__);
+
+    // compute all the tx-wide hashes
     {
         // compute sha_prevouts and sha_sequences
-        cx_sha256_t sha_prevouts_context, sha_sequences_context;
+        cx_sha256_t *sha_prevouts_context = &state->sighash_context;
+        cx_sha256_t *sha_sequences_context = &state->sighash_context2;
 
         // compute hashPrevouts and hashSequence
-        cx_sha256_init(&sha_prevouts_context);
-        cx_sha256_init(&sha_sequences_context);
+        cx_sha256_init(sha_prevouts_context);
+        cx_sha256_init(sha_sequences_context);
 
         for (unsigned int i = 0; i < state->n_inputs; i++) {
             // get this input's map
@@ -1591,7 +1653,7 @@ static void sign_segwit(dispatcher_context_t *dc) {
                 return;
             }
 
-            crypto_hash_update(&sha_prevouts_context.header, ith_prevout_hash, 32);
+            crypto_hash_update(&sha_prevouts_context->header, ith_prevout_hash, 32);
 
             uint8_t ith_prevout_n_raw[4];
             if (4 != call_get_merkleized_map_value(dc,
@@ -1604,7 +1666,7 @@ static void sign_segwit(dispatcher_context_t *dc) {
                 return;
             }
 
-            crypto_hash_update(&sha_prevouts_context.header, ith_prevout_n_raw, 4);
+            crypto_hash_update(&sha_prevouts_context->header, ith_prevout_n_raw, 4);
 
             uint8_t ith_nSequence_raw[4];
             if (4 != call_get_merkleized_map_value(dc,
@@ -1617,33 +1679,50 @@ static void sign_segwit(dispatcher_context_t *dc) {
                 memset(ith_nSequence_raw, 0xFF, 4);
             }
 
-            crypto_hash_update(&sha_sequences_context.header, ith_nSequence_raw, 4);
+            crypto_hash_update(&sha_sequences_context->header, ith_nSequence_raw, 4);
         }
 
-        crypto_hash_digest(&sha_prevouts_context.header, state->hashes.sha_prevouts, 32);
-        crypto_hash_digest(&sha_sequences_context.header, state->hashes.sha_sequences, 32);
+        crypto_hash_digest(&sha_prevouts_context->header, state->hashes.sha_prevouts, 32);
+        crypto_hash_digest(&sha_sequences_context->header, state->hashes.sha_sequences, 32);
     }
+
+    dc->next(sign_segwit3);
+}
+
+static void sign_segwit3(dispatcher_context_t *dc) {
+    sign_psbt_state_t *state = (sign_psbt_state_t *) &G_command_state;
+
+    LOG_PROCESSOR(dc, __FILE__, __LINE__, __func__);
 
     {
         // compute sha_outputs
-        cx_sha256_t sha_outputs_context;
-        cx_sha256_init(&sha_outputs_context);
+        cx_sha256_t *sha_outputs_context = &state->sighash_context;
+        cx_sha256_init(sha_outputs_context);
 
-        if (hash_outputs(dc, &sha_outputs_context.header) == -1) {
+        if (hash_outputs(dc, &sha_outputs_context->header) == -1) {
             return;
         }
 
-        crypto_hash_digest(&sha_outputs_context.header, state->hashes.sha_outputs, 32);
+        crypto_hash_digest(&sha_outputs_context->header, state->hashes.sha_outputs, 32);
     }
+
+    dc->next(sign_segwit4);
+}
+
+static void sign_segwit4(dispatcher_context_t *dc) {
+    sign_psbt_state_t *state = (sign_psbt_state_t *) &G_command_state;
+
+    LOG_PROCESSOR(dc, __FILE__, __LINE__, __func__);
 
     {
         // compute sha_amounts and sha_scriptpubkeys
         // TODO: could be skipped if there are no segwitv1 inputs to sign
 
-        cx_sha256_t sha_amounts_context, sha_scriptpubkeys_context;
+        cx_sha256_t *sha_amounts_context = &state->sighash_context;
+        cx_sha256_t *sha_scriptpubkeys_context = &state->sighash_context2;
 
-        cx_sha256_init(&sha_amounts_context);
-        cx_sha256_init(&sha_scriptpubkeys_context);
+        cx_sha256_init(sha_amounts_context);
+        cx_sha256_init(sha_scriptpubkeys_context);
 
         for (unsigned int i = 0; i < state->n_inputs; i++) {
             // get this input's map
@@ -1675,20 +1754,22 @@ static void sign_segwit(dispatcher_context_t *dc) {
 
             uint8_t *scriptPubKey = wit_utxo + 9;
 
-            crypto_hash_update(&sha_amounts_context.header, wit_utxo, 8);
+            crypto_hash_update(&sha_amounts_context->header, wit_utxo, 8);
 
-            crypto_hash_update_varint(&sha_scriptpubkeys_context.header, scriptPubKey_len);
-            crypto_hash_update(&sha_scriptpubkeys_context.header, scriptPubKey, scriptPubKey_len);
+            crypto_hash_update_varint(&sha_scriptpubkeys_context->header, scriptPubKey_len);
+            crypto_hash_update(&sha_scriptpubkeys_context->header, scriptPubKey, scriptPubKey_len);
         }
 
-        crypto_hash_digest(&sha_amounts_context.header, state->hashes.sha_amounts, 32);
-        crypto_hash_digest(&sha_scriptpubkeys_context.header, state->hashes.sha_scriptpubkeys, 32);
+        crypto_hash_digest(&sha_amounts_context->header, state->hashes.sha_amounts, 32);
+        crypto_hash_digest(&sha_scriptpubkeys_context->header, state->hashes.sha_scriptpubkeys, 32);
     }
 
-    if (segwit_version == 0) {
+    LOG_PROCESSOR(dc, __FILE__, __LINE__, __func__);
+
+    if (state->cur_input.segwit_version == 0) {
         dc->next(sign_segwit_v0);
         return;
-    } else if (segwit_version == 1) {
+    } else if (state->cur_input.segwit_version == 1) {
         dc->next(sign_segwit_v1);
 
         return;
@@ -1703,25 +1784,26 @@ static void sign_segwit_v0(dispatcher_context_t *dc) {
 
     LOG_PROCESSOR(dc, __FILE__, __LINE__, __func__);
 
-    cx_sha256_t sighash_context;
-    cx_sha256_init(&sighash_context);
+    // hack to save stack: we store the sighash context in the global space
+    // TODO: remove once the stack limit is removed
+    cx_sha256_init(&state->sighash_context);
 
     uint8_t tmp[8];
 
     // nVersion
     write_u32_le(tmp, 0, state->tx_version);
-    crypto_hash_update(&sighash_context.header, tmp, 4);
+    crypto_hash_update(&state->sighash_context.header, tmp, 4);
 
     {
         uint8_t dbl_hash[32];
 
         // add to hash: hashPrevouts = sha256(sha_prevouts)
         cx_hash_sha256(state->hashes.sha_prevouts, 32, dbl_hash, 32);
-        crypto_hash_update(&sighash_context.header, dbl_hash, 32);
+        crypto_hash_update(&state->sighash_context.header, dbl_hash, 32);
 
         // add to hash: hashSequence sha256(sha_sequences)
         cx_hash_sha256(state->hashes.sha_sequences, 32, dbl_hash, 32);
-        crypto_hash_update(&sighash_context.header, dbl_hash, 32);
+        crypto_hash_update(&state->sighash_context.header, dbl_hash, 32);
     }
 
     {
@@ -1739,7 +1821,7 @@ static void sign_segwit_v0(dispatcher_context_t *dc) {
             return;
         }
 
-        crypto_hash_update(&sighash_context.header, prevout_hash, 32);
+        crypto_hash_update(&state->sighash_context.header, prevout_hash, 32);
 
         uint8_t prevout_n_raw[4];
         if (4 != call_get_merkleized_map_value(dc,
@@ -1752,15 +1834,15 @@ static void sign_segwit_v0(dispatcher_context_t *dc) {
             return;
         }
 
-        crypto_hash_update(&sighash_context.header, prevout_n_raw, 4);
+        crypto_hash_update(&state->sighash_context.header, prevout_n_raw, 4);
     }
 
     // scriptCode
     if (is_p2wpkh(state->cur_input.script, state->cur_input.script_len)) {
         // P2WPKH(script[2:22])
-        crypto_hash_update_u32(&sighash_context.header, 0x1976a914);
-        crypto_hash_update(&sighash_context.header, state->cur_input.script + 2, 20);
-        crypto_hash_update_u16(&sighash_context.header, 0x88ac);
+        crypto_hash_update_u32(&state->sighash_context.header, 0x1976a914);
+        crypto_hash_update(&state->sighash_context.header, state->cur_input.script + 2, 20);
+        crypto_hash_update_u16(&state->sighash_context.header, 0x88ac);
     } else if (is_p2wsh(state->cur_input.script, state->cur_input.script_len)) {
         // P2WSH
 
@@ -1774,7 +1856,7 @@ static void sign_segwit_v0(dispatcher_context_t *dc) {
                                                              (uint8_t[]){PSBT_IN_WITNESS_SCRIPT},
                                                              1,
                                                              &witnessScript_hash_context.header,
-                                                             &sighash_context.header);
+                                                             &state->sighash_context.header);
 
         if (witnessScript_len < 0) {
             PRINTF("Error fetching witnessScript\n");
@@ -1815,7 +1897,7 @@ static void sign_segwit_v0(dispatcher_context_t *dc) {
             return;
         }
 
-        crypto_hash_update(&sighash_context.header,
+        crypto_hash_update(&state->sighash_context.header,
                            witness_utxo,
                            8);  // only the first 8 bytes (amount)
     }
@@ -1832,7 +1914,7 @@ static void sign_segwit_v0(dispatcher_context_t *dc) {
             // if no PSBT_IN_SEQUENCE is present, we must assume nSequence 0xFFFFFFFF
             memset(nSequence_raw, 0xFF, 4);
         }
-        crypto_hash_update(&sighash_context.header, nSequence_raw, 4);
+        crypto_hash_update(&state->sighash_context.header, nSequence_raw, 4);
     }
 
     {
@@ -1841,19 +1923,19 @@ static void sign_segwit_v0(dispatcher_context_t *dc) {
         uint8_t hashOutputs[32];
         cx_hash_sha256(state->hashes.sha_outputs, 32, hashOutputs, 32);
 
-        crypto_hash_update(&sighash_context.header, hashOutputs, 32);
+        crypto_hash_update(&state->sighash_context.header, hashOutputs, 32);
     }
 
     // nLocktime
     write_u32_le(tmp, 0, state->locktime);
-    crypto_hash_update(&sighash_context.header, tmp, 4);
+    crypto_hash_update(&state->sighash_context.header, tmp, 4);
 
     // sighash type
     write_u32_le(tmp, 0, state->cur_input.sighash_type);
-    crypto_hash_update(&sighash_context.header, tmp, 4);
+    crypto_hash_update(&state->sighash_context.header, tmp, 4);
 
     // compute sighash
-    crypto_hash_digest(&sighash_context.header, state->sighash, 32);
+    crypto_hash_digest(&state->sighash_context.header, state->sighash, 32);
     cx_hash_sha256(state->sighash, 32, state->sighash, 32);
 
     dc->next(sign_sighash_ecdsa);
@@ -1864,38 +1946,39 @@ static void sign_segwit_v1(dispatcher_context_t *dc) {
 
     LOG_PROCESSOR(dc, __FILE__, __LINE__, __func__);
 
-    cx_sha256_t sighash_context;
-    crypto_tr_tagged_hash_init(&sighash_context, BIP0341_sighash_tag, sizeof(BIP0341_sighash_tag));
+    crypto_tr_tagged_hash_init(&state->sighash_context,
+                               BIP0341_sighash_tag,
+                               sizeof(BIP0341_sighash_tag));
     // the first 0x00 byte is not part of SigMsg
-    crypto_hash_update_u8(&sighash_context.header, 0x00);
+    crypto_hash_update_u8(&state->sighash_context.header, 0x00);
 
     uint8_t tmp[32];
 
     // hash type
     uint8_t sighash_byte = (uint8_t) (state->cur_input.sighash_type & 0xFF);
-    crypto_hash_update_u8(&sighash_context.header, sighash_byte);
+    crypto_hash_update_u8(&state->sighash_context.header, sighash_byte);
 
     // nVersion
     write_u32_le(tmp, 0, state->tx_version);
-    crypto_hash_update(&sighash_context.header, tmp, 4);
+    crypto_hash_update(&state->sighash_context.header, tmp, 4);
 
     // nLocktime
     write_u32_le(tmp, 0, state->locktime);
-    crypto_hash_update(&sighash_context.header, tmp, 4);
+    crypto_hash_update(&state->sighash_context.header, tmp, 4);
 
     if ((sighash_byte & 0x80) != SIGHASH_ANYONECANPAY) {
-        crypto_hash_update(&sighash_context.header, state->hashes.sha_prevouts, 32);
-        crypto_hash_update(&sighash_context.header, state->hashes.sha_amounts, 32);
-        crypto_hash_update(&sighash_context.header, state->hashes.sha_scriptpubkeys, 32);
-        crypto_hash_update(&sighash_context.header, state->hashes.sha_sequences, 32);
+        crypto_hash_update(&state->sighash_context.header, state->hashes.sha_prevouts, 32);
+        crypto_hash_update(&state->sighash_context.header, state->hashes.sha_amounts, 32);
+        crypto_hash_update(&state->sighash_context.header, state->hashes.sha_scriptpubkeys, 32);
+        crypto_hash_update(&state->sighash_context.header, state->hashes.sha_sequences, 32);
     }
 
     if ((sighash_byte & 3) != SIGHASH_NONE && (sighash_byte & 3) != SIGHASH_SINGLE) {
-        crypto_hash_update(&sighash_context.header, state->hashes.sha_outputs, 32);
+        crypto_hash_update(&state->sighash_context.header, state->hashes.sha_outputs, 32);
     }
 
     // annex and ext_flags not supported, so spend_type = 0
-    crypto_hash_update_u8(&sighash_context.header, 0x00);
+    crypto_hash_update_u8(&state->sighash_context.header, 0x00);
 
     if ((sighash_byte & 0x80) == SIGHASH_ANYONECANPAY) {
         // outpoint (hash)
@@ -1908,7 +1991,7 @@ static void sign_segwit_v1(dispatcher_context_t *dc) {
             SEND_SW(dc, SW_INCORRECT_DATA);
             return;
         }
-        crypto_hash_update(&sighash_context.header, tmp, 32);
+        crypto_hash_update(&state->sighash_context.header, tmp, 32);
 
         // outpoint (output index)
         if (4 != call_get_merkleized_map_value(dc,
@@ -1920,14 +2003,14 @@ static void sign_segwit_v1(dispatcher_context_t *dc) {
             SEND_SW(dc, SW_INCORRECT_DATA);
             return;
         }
-        crypto_hash_update(&sighash_context.header, tmp, 4);
+        crypto_hash_update(&state->sighash_context.header, tmp, 4);
 
         // amount
         write_u64_le(tmp, 0, state->cur_input.prevout_amount);
-        crypto_hash_update(&sighash_context.header, tmp, 8);
+        crypto_hash_update(&state->sighash_context.header, tmp, 8);
 
         // scriptPubKey
-        crypto_hash_update(&sighash_context.header,
+        crypto_hash_update(&state->sighash_context.header,
                            state->cur_input.prevout_scriptpubkey,
                            state->cur_input.prevout_scriptpubkey_len);
 
@@ -1941,18 +2024,18 @@ static void sign_segwit_v1(dispatcher_context_t *dc) {
             // if no PSBT_IN_SEQUENCE is present, we must assume nSequence 0xFFFFFFFF
             memset(tmp, 0xFF, 4);
         }
-        crypto_hash_update(&sighash_context.header, tmp, 4);
+        crypto_hash_update(&state->sighash_context.header, tmp, 4);
     } else {
         // input_index
         write_u32_le(tmp, 0, state->cur_input_index);
-        crypto_hash_update(&sighash_context.header, tmp, 4);
+        crypto_hash_update(&state->sighash_context.header, tmp, 4);
     }
 
     // no annex
 
     // TODO: SIGHASH_SINGLE not implemented
 
-    crypto_hash_digest(&sighash_context.header, state->sighash, 32);
+    crypto_hash_digest(&state->sighash_context.header, state->sighash, 32);
 
     dc->next(sign_sighash_schnorr);
 }
