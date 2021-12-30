@@ -258,6 +258,7 @@ typedef enum btchip_coin_flags_e {
 typedef enum btchip_coin_kind_e {
     COIN_KIND_BITCOIN_TESTNET,
     COIN_KIND_BITCOIN,
+    COIN_KIND_UFO,
     COIN_KIND_BITCOIN_CASH,
     COIN_KIND_BITCOIN_GOLD,
     COIN_KIND_LITECOIN,
