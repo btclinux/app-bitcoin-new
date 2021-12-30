@@ -118,6 +118,24 @@ APPNAME ="Bitcoin Test (legacy)"
 
 APP_LOAD_PARAMS += --path $(APP_PATH)
 
+else ifeq ($(COIN),ufo)
+# UFO
+DEFINES   += BIP32_PUBKEY_VERSION=0x00000000 # unused
+DEFINES   += BIP44_COIN_TYPE=202
+DEFINES   += BIP44_COIN_TYPE_2=202
+DEFINES   += COIN_P2PKH_VERSION=111
+DEFINES   += COIN_P2SH_VERSION=130
+DEFINES   += COIN_FAMILY=1
+DEFINES   += COIN_COINID=\"UFO\"
+DEFINES   += COIN_COINID_HEADER=\"UFO\"
+DEFINES   += COIN_COINID_NAME=\"UFO\"
+DEFINES   += COIN_COINID_SHORT=\"UFO\"
+DEFINES   += COIN_NATIVE_SEGWIT_PREFIX=\"uf\"
+DEFINES   += COIN_KIND=COIN_KIND_UFO
+DEFINES   += COIN_FLAGS=FLAG_SEGWIT_CHANGE_SUPPORT
+APPNAME ="UFO"
+APP_LOAD_PARAMS += --path $(APP_PATH)
+
 else ifeq ($(COIN),bitcoin_cash)
 # Bitcoin cash
 # Initial fork from Bitcoin, public key access is authorized. Signature is different thanks to the forkId
